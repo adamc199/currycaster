@@ -1,6 +1,8 @@
 # Currycaster
 
-Broadcast automation software for the RODE RØDECaster Pro II on Linux.
+Podcast playout software developed and used by Adam Curry on The No Agenda Show and many other podcasts that record live and in real-time.
+
+Currently tested with the RODE RØDECaster Pro II using the [RODECaster Pro II PipeWire configuration](https://github.com/adamc199/rodecaster-pro2-pipewire).
 
 ## Features
 
