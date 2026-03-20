@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-print("DEBUG: Starting Broadcast System (v41.4 - Fixed Shadowing Crashes)...")
+print("DEBUG: Starting Broadcast System (v41.5 - Fixed PFL Race Condition)...")
 import sys, subprocess, struct, json, os, time, gi, mido, pulsectl
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -90,6 +90,7 @@ class AudioRouter:
         self.sinks = self.refresh_devices()
         self.global_pgm_sink = self.sinks[0].name if self.sinks else None
         self.global_cue_sink = self.sinks[0].name if self.sinks else None
+        self.pending_routes = {}
         self.load_config()
     def refresh_devices(self):
         self.sinks = self.pulse.sink_list(); return self.sinks
@@ -117,13 +118,22 @@ class AudioRouter:
         for p in self.active_players: self.route_stream(f"Currycaster_Player_{p.player_id}", p.pfl)
         for cid in self.active_cart_ids: self.route_stream(cid, False)
     def route_stream(self, app_id, is_cue, retries=8):
+        if app_id in self.pending_routes:
+            self.pending_routes[app_id] = False
         target = self.global_cue_sink if is_cue else self.global_pgm_sink
+        self.pending_routes[app_id] = True
         def attempt(rem):
+            if not self.pending_routes.get(app_id, False):
+                return
             try:
                 t_snk = next((s for s in self.pulse.sink_list() if s.name == target), None)
                 t_str = next((i for i in self.pulse.sink_input_list() if i.proplist.get('application.name') == app_id), None)
-                if t_str and t_snk and t_str.sink != t_snk.index:
-                    self.pulse.sink_input_move(t_str.index, t_snk.index)
+                if t_str and t_snk:
+                    if t_str.sink != t_snk.index:
+                        self.pulse.sink_input_move(t_str.index, t_snk.index)
+                        self.pending_routes[app_id] = False
+                    else:
+                        self.pending_routes[app_id] = False
                 elif rem > 0: QTimer.singleShot(150, lambda: attempt(rem - 1))
             except: pass
         attempt(retries)
