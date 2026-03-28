@@ -40,6 +40,16 @@ Currently tested with the RODE RØDECaster Pro II using the [RODECaster Pro II P
 - **CC and Note** support - map knobs, faders, buttons, and pads
 - **Persistent mappings** - saved to `midi_config.json`
 
+### IPC Server
+- **TCP socket on port 9876** — accepts a file path and loads it into the first available player
+- Allows external scripts, automation tools, or AI assistants to trigger audio playback
+- Send any local audio file path as a UTF-8 string to `127.0.0.1:9876`
+
+**Example:**
+```bash
+echo "/path/to/audio.mp3" | nc 127.0.0.1 9876
+```
+
 ### File Library
 - **Background indexing** - scans media folders without blocking UI
 - **Folder browser** - tree view of media directory
