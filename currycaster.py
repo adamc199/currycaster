@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import logging
 logging.basicConfig(filename='/home/adam/currycaster.log', level=logging.DEBUG, format='%(asctime)s %(message)s')
-print("DEBUG: Starting Broadcast System (v41.4 - Fixed Shadowing Crashes)...")
+print("DEBUG: Starting Broadcast System (v41.7 - IPC Thread Safety Fix)...")
 logging.info("Starting currycaster")
 import sys, subprocess, struct, json, os, time, gi, mido, pulsectl
 from pathlib import Path
@@ -94,8 +94,30 @@ class AudioRouter:
         self.global_pgm_sink = self.sinks[0].name if self.sinks else None
         self.global_cue_sink = self.sinks[0].name if self.sinks else None
         self.load_config()
+        self.heartbeat = QTimer(); self.heartbeat.timeout.connect(self._heartbeat_check); self.heartbeat.start(30000)
+    def _reconnect_pulse(self):
+        try: self.pulse.close()
+        except: pass
+        try:
+            self.pulse = pulsectl.Pulse('currycaster-router')
+            logging.info("AudioRouter: reconnected to PulseAudio")
+        except Exception as e:
+            logging.error(f"AudioRouter: reconnect failed: {e}")
+    def _heartbeat_check(self):
+        try:
+            self.pulse.sink_list()
+        except Exception as e:
+            logging.warning(f"AudioRouter: heartbeat failed ({e}), reconnecting...")
+            self._reconnect_pulse()
     def refresh_devices(self):
-        self.sinks = self.pulse.sink_list(); return self.sinks
+        try:
+            self.sinks = self.pulse.sink_list()
+        except Exception as e:
+            logging.warning(f"AudioRouter: refresh_devices failed ({e}), reconnecting...")
+            self._reconnect_pulse()
+            try: self.sinks = self.pulse.sink_list()
+            except: self.sinks = []
+        return self.sinks
     def load_config(self):
         if not os.path.exists(AUDIO_CONFIG_FILE): return
         try:
@@ -104,12 +126,12 @@ class AudioRouter:
                 an = [s.name for s in self.sinks]
                 if d.get("program_sink") in an: self.global_pgm_sink = d["program_sink"]
                 if d.get("cue_sink") in an: self.global_cue_sink = d["cue_sink"]
-        except: pass
+        except Exception as e: logging.warning(f"AudioRouter: load_config failed: {e}")
     def save_config(self):
         try:
             with open(AUDIO_CONFIG_FILE, 'w') as f:
                 json.dump({"program_sink": self.global_pgm_sink, "cue_sink": self.global_cue_sink}, f, indent=4)
-        except: pass
+        except Exception as e: logging.warning(f"AudioRouter: save_config failed: {e}")
     def set_program_device(self, name): self.global_pgm_sink = name; self.save_config(); self.move_all_streams()
     def set_cue_device(self, name): self.global_cue_sink = name; self.save_config(); self.move_all_streams()
     def register_player(self, p):
@@ -121,14 +143,23 @@ class AudioRouter:
         for cid in self.active_cart_ids: self.route_stream(cid, False)
     def route_stream(self, app_id, is_cue, retries=8):
         target = self.global_cue_sink if is_cue else self.global_pgm_sink
-        def attempt(rem):
+        def attempt(rem, reconnected=False):
             try:
                 t_snk = next((s for s in self.pulse.sink_list() if s.name == target), None)
                 t_str = next((i for i in self.pulse.sink_input_list() if i.proplist.get('application.name') == app_id), None)
                 if t_str and t_snk and t_str.sink != t_snk.index:
                     self.pulse.sink_input_move(t_str.index, t_snk.index)
                 elif rem > 0: QTimer.singleShot(150, lambda: attempt(rem - 1))
-            except: pass
+            except Exception as e:
+                if not reconnected:
+                    logging.warning(f"AudioRouter: route_stream({app_id}) failed ({e}), reconnecting...")
+                    self._reconnect_pulse()
+                    QTimer.singleShot(200, lambda: attempt(rem, reconnected=True))
+                elif rem > 0:
+                    logging.warning(f"AudioRouter: route_stream({app_id}) retry failed ({e}), {rem} retries left")
+                    QTimer.singleShot(150, lambda: attempt(rem - 1, reconnected=True))
+                else:
+                    logging.error(f"AudioRouter: route_stream({app_id}) gave up after all retries: {e}")
         attempt(retries)
     def route_player(self, pid, is_cue): self.route_stream(f"Currycaster_Player_{pid}", is_cue)
 
@@ -668,12 +699,15 @@ class MainWindow(QWidget):
 import socket
 import threading
 
-class IpcServer:
+class IpcServer(QObject):
+    file_received = pyqtSignal(str)
+
     def __init__(self, load_func):
-        self.load_func = load_func
+        super().__init__()
+        self.file_received.connect(load_func)
         self.server_socket = None
         self.running = False
-    
+
     def start(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -683,7 +717,7 @@ class IpcServer:
         thread = threading.Thread(target=self._accept_loop, daemon=True)
         thread.start()
         logging.info("IPC Server listening on port 9876")
-    
+
     def _accept_loop(self):
         while self.running:
             try:
@@ -691,14 +725,11 @@ class IpcServer:
                 data = client_socket.recv(4096).decode('utf-8').strip()
                 if data:
                     logging.info(f"IPC received: {data}")
-                    try:
-                        self.load_func(data)
-                    except Exception as e:
-                        logging.error(f"IPC error: {e}")
+                    self.file_received.emit(data)
                 client_socket.close()
             except Exception as e:
                 logging.error(f"IPC accept error: {e}")
-    
+
     def stop(self):
         self.running = False
         if self.server_socket:
